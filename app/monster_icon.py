@@ -1,74 +1,116 @@
-from flask import Flask, Response, request
-from flask import jsonify
+from flask import Flask, Response, request, abort, jsonify
 import requests
 import hashlib
-import redis
 import socket
+import redis
+import os
+import logging
+
+LOGLEVEL = os.environ.get("LOGLEVEL", "INFO").upper()
+logging.basicConfig(level=LOGLEVEL)
 
 app = Flask(__name__)
-redis_cache = redis.StrictRedis(host='redis', port=6379, socket_connect_timeout=2, socket_timeout=2, db=0)
+cache = redis.StrictRedis(host="redis", port=6379, db=0)
 salt = "UNIQUE_SALT"
-default_name = 'John Doe'
+default_name = "toi"
 
-@app.route('/', methods=['GET', 'POST'])
+
+@app.route("/", methods=["GET", "POST"])
 def mainpage():
 
-    try:
-        visits = redis_cache.incr("counter")
-    except redis.RedisError:
-        visits = "<i>cannot connect to Redis, counter disabled</i>"
-
     name = default_name
-    if request.method == 'POST':
-        name = request.form['name']
+    if request.method == "POST":
+        name = request.form["name"]
+
+    try:
+        visits = cache.incr("counter")
+    except redis.RedisError:
+        visits = "&#128565;"  # 😵
+        logging.warning("Cache redis injoignable, compteur désactivé")
+
     salted_name = salt + name
     name_hash = hashlib.sha256(salted_name.encode()).hexdigest()
-
-    page = '''
-        <html>
-          <head>
-            <title>Monster Icon</title>
-            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/skeleton/2.0.4/skeleton.css">
-          </head>
-          <body style="text-align: center">
-                <h1>Monster Icon</h1>
-                <form method="POST">
-                <strong>Hello dear <input type="text" name="name" value="{name}">
-                <input type="submit" value="submit"> !
+    header = "<html><head><title>Identidock</title></head><body>"
+    body = """<form method="POST">
+                Salut <input type="text" name="name" value="{name}"> !
+                <input type="submit" value="submit">
                 </form>
-                <div>
-                  <h4>Here is your monster icon :</h4>
-                  <img src="/monster/{name_hash}"/>
-                <div>
+                <p>Tu ressembles à ça :
+                <img src="/monster/{name_hash}"/>
+                </p>
+                <br>
+               """.format(
+        name=name, name_hash=name_hash
+    )
 
-          </br></br><h4> container info: </h4>
+    footer = """ <h4>Infos container :</h4>
           <ul>
            <li>Hostname: {hostname}</li>
-           <li>Visits: {visits} </li>
-          </ul></strong>
-        </body>
-       </html>
-    '''.format(name=name, name_hash=name_hash, hostname=socket.gethostname(), visits=visits)
+           <li>Visits: {visits}</li>
+          </ul>
+        </body></html>
+        """.format(
+        hostname=socket.gethostname(), visits=visits
+    )
+    return header + body + footer
 
-    return page
 
-
-@app.route('/monster/<name>')
+@app.route("/monster/<name>")
 def get_identicon(name):
-    image = redis_cache.get(name)
-    if image is None:
-        print ("Cache miss: picture icon not found in Redis", flush=True)
-        r = requests.get('http://dnmonster:8080/monster/' + name + '?size=80')
-        image = r.content
-    redis_cache.set(name, image)
+    found_in_cache = False
 
-    return Response(image, mimetype='image/png')
+    try:
+        image = cache.get(name)
+        redis_unreachable = False
+        if image is not None:
+            found_in_cache = True
+            logging.info("Image trouvée dans le cache")
+    except:
+        redis_unreachable = True
+        logging.warning("Cache redis injoignable")
 
-@app.route('/healthz')
+    if not found_in_cache:
+        logging.info("Image non trouvée dans le cache")
+        try:
+            r = requests.get("http://dnmonster:8080/monster/" + name + "?size=80")
+            image = r.content
+            logging.info("Image générée grâce au service dnmonster")
+
+            if not redis_unreachable:
+                cache.set(name, image)
+                logging.info("Image enregistrée dans le cache redis")
+        except:
+            logging.critical("Le service dnmonster est injoignable !")
+            abort(503)
+
+    return Response(image, mimetype="image/png")
+
+
+@app.route("/healthz")
 def healthz():
-    data = {'ready': 'true'}
-    return jsonify(data)
+    try:
+        requests.get("http://dnmonster:8080/monster/test?size=80")
+        dnmonster_ready = True
+    except:
+        logging.critical("Le service dnmonster est injoignable !")
+        dnmonster_ready = False
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    try:
+        cache.incr("test")
+        redis_ready = True
+    except redis.RedisError:
+        logging.warning("Le cache redis est injoignable !")
+        redis_ready = False
 
+    monstericon_ready = dnmonster_ready
+    data = {
+        "monstericon_ready": str(monstericon_ready),
+        "dnmonster_ready": str(dnmonster_ready),
+        "redis_ready": str(redis_ready),
+    }
+    
+    return jsonify(data), 200 if monstericon_ready else 503
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
